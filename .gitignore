@@ -1,0 +1,36 @@
+# Ignore venvs
+venv/
+venv310/
+*/venv/
+*/venv310/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VSCode
+.vscode/
+
+# Data files you don't want to push
+project/data/*.jsonl
+project/data/*.json
+project/data/*.log
+
+# Cache, local models, embeddings
+*.npy
+*.npz
+*.pt
+*.ckpt
+
+# Huggingface cache
+~/.cache/huggingface/
+.cache/
+
+# Uvicorn reload temp files
+*.pid
+
+# Windows junk
+Thumbs.db
+desktop.ini
