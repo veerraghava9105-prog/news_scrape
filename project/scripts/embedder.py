@@ -64,13 +64,16 @@ def upsert_points(client: QdrantClient, ids: List[str], embs: np.ndarray, payloa
 # --- Main ---
 def main():
     rows = read_jsonl(ARTICLES)
-    print(f"📁 total docs in jsonl: {len(rows)}, new to embed: {len(new_docs)}")
+    print(f"📁 total docs in jsonl: {len(rows)}")
+
     client = QdrantClient("localhost", port=6333)
     print("🔎 Fetching existing IDs from Qdrant…")
-    existing_ids = fetch_qdrant_ids(client)
+
+    # Make sure stored IDs are cast to strings for comparison
+    existing_ids = {str(i) for i in fetch_qdrant_ids(client)}
     print(f"✅ Qdrant already has {len(existing_ids)} vectors")
 
-    # Determine actually new docs
+    # Now declare new doc containers
     new_docs = []
     new_ids = []
     payloads = []
@@ -79,7 +82,8 @@ def main():
         url = doc.get("url") or doc.get("id")
         if not url:
             continue
-        pid = str(uuid.uuid5(uuid.NAMESPACE_URL, url))
+        pid = str(uuid.uuid5(uuid.NAMESPACE_URL, url))  # <- string UUID5
+
         if pid not in existing_ids:
             new_docs.append(doc)
             new_ids.append(pid)
@@ -90,15 +94,17 @@ def main():
                 "time_scraped": doc.get("time", "")
             })
 
+    # Now print after variable exists ✅
+    print(f"🧠 new to embed: {len(new_ids)}")
+
     print(f"🆕 Found {len(new_ids)} new docs that need embeddings.")
 
     if not new_ids:
         print("🛑 Nothing new to embed. Go sleep.")
         return
 
-    print("🔁 Loading model (one-time SO keep this process alive!)…")
-    model = SentenceTransformer(MODEL_NAME, device="cpu")  # CPU default
-    # if GPU available we’ll auto-switch using device="cuda"
+    print("🔁 Loading model…")
+    model = SentenceTransformer(MODEL_NAME, device="cpu")
     print(f"⚡ Model ready: {MODEL_NAME}")
 
     print(f"📚 Embedding {len(new_ids)} new documents in batches of {BATCH} …")
@@ -111,12 +117,18 @@ def main():
         batch_payloads = payloads[i:i+BATCH]
 
         arr = embed_batch(batch_texts, model)
-        upsert_points(client, batch_ids, arr, batch_payloads)
+
+        # Upsert using correct Qdrant client
+        pts = []
+        for j, pid in enumerate(batch_ids):
+            pts.append(PointStruct(id=pid, vector=arr[j].tolist(), payload=batch_payloads[j]))
+
+        client.upsert(COLLECTION, points=pts)
 
         print(f"  ⚡ upserted batch {i//BATCH+1} ({len(batch_ids)} vectors)")
 
-    dur = time.time() - t0
-    print(f"✅ Done in {dur:.1f}s total!")
+    print(f"✅ Done in {time.time()-t0:.1f}s total!")
+
 
 if __name__ == "__main__":
     main()
