@@ -1,14 +1,13 @@
 # project/scripts/ml_service.py
 # Run with:
-#   uvicorn scripts.ml_service:app --reload --port 8000
+# uvicorn project.scripts.ml_service:app --reload --port 8000
 
 from typing import List, Optional, Dict
-
 import json
 import time
 from pathlib import Path
+import re
 
-import hdbscan
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -22,6 +21,8 @@ from qdrant_client.http.models import (
     MatchValue,
 )
 from sentence_transformers import SentenceTransformer
+from pymongo import MongoClient  # <--- ADDED
+
 
 # ------------------ CONFIG ------------------
 
@@ -31,17 +32,14 @@ COLLECTION_NAME = "news_articles"
 MODEL_NAME = "BAAI/bge-base-en-v1.5"
 VECTOR_SIZE = 768
 
-# threshold for “same story” grouping (cosine-ish score)
 DEFAULT_SAME_STORY_THRESHOLD = 0.82
-
-# threshold for assigning to an existing topic cluster
 DEFAULT_CLUSTER_ASSIGN_THRESHOLD = 0.72
 
-BASE_DIR = Path(__file__).resolve().parents[1]  # project/
+BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 CLUSTERS_JSON = DATA_DIR / "clusters.json"
 
-app = FastAPI(title="News ML Service", version="2.1.0")
+app = FastAPI(title="News ML Service", version="2.4.0")
 
 
 # ------------------ Pydantic Schemas ------------------
@@ -56,8 +54,7 @@ class SearchRequest(BaseModel):
 
 
 class SearchResult(BaseModel):
-    # 👉 This is the PUBLIC ID we expose to the outside world = URL
-    id: str            # URL
+    id: str
     score: float
     title: Optional[str] = None
     url: Optional[str] = None
@@ -68,8 +65,7 @@ class SearchResult(BaseModel):
 
 
 class SameStoryByIdRequest(BaseModel):
-    # 👉 Here id = URL (not Qdrant UUID)
-    id: str            # URL of the anchor article
+    id: str
     limit: int = 25
     min_score: float = DEFAULT_SAME_STORY_THRESHOLD
 
@@ -93,110 +89,117 @@ class ClusterAssignRequest(BaseModel):
 
 
 class ClusterAssignResponse(BaseModel):
-    has_clusters: bool           # do we have centroids loaded at all?
-    assigned_cluster: int        # -1 if nothing passes threshold
+    has_clusters: bool
+    assigned_cluster: int
     best_score: float
     num_clusters_considered: int
 
 
-class ClusterRequest(BaseModel):
-    ids: List[str]               # still Qdrant UUIDs – debug only
-    min_cluster_size: int = 5
+# ======= NEW SUMMARIZATION SCHEMAS =======
 
-
-class ClusterResultItem(BaseModel):
+class SummarizeClusterRequest(BaseModel):
     id: str
-    label: int
+    max_sentences: int = 4
+    per_article_limit: int = 5
+
+
+class SummarizeClusterResponse(BaseModel):
+    anchor: SearchResult
+    items: List[SearchResult]
+    summary: str
+    highlights: Dict[str, List[str]]
+    took_seconds: float
+
+
+class EventIdRequest(BaseModel):
+    url: str
 
 
 # ------------------ Startup ------------------
 
 @app.on_event("startup")
 def startup_event():
-    """
-    - Connect to Qdrant
-    - Ensure collection exists
-    - Load sentence transformer
-    - Load cluster centroids (if clusters.json present)
-    """
+
     print("🌍 booting ML service for all souls…")
 
+    # QDRANT
     client = QdrantClient(QDRANT_HOST, port=QDRANT_PORT)
-
-    # Ensure collection exists (safe if already there)
     collections = {c.name for c in client.get_collections().collections}
+
     if COLLECTION_NAME not in collections:
-        print(f"⚠️  Collection '{COLLECTION_NAME}' not found. Creating empty one...")
+        print(f"⚠ Missing collection '{COLLECTION_NAME}'. Creating…")
         client.create_collection(
             collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(
-                size=VECTOR_SIZE,
-                distance=Distance.COSINE,
-            ),
+            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE)
         )
-        print(f"✅ Created collection '{COLLECTION_NAME}'")
+        print("✅ Collection created")
 
-    # Model
+    # MODEL
     try:
         model = SentenceTransformer(MODEL_NAME, device="cuda")
-        print("🔥 Model loaded on GPU")
+        print("🔥 Model on GPU")
     except Exception:
         model = SentenceTransformer(MODEL_NAME, device="cpu")
-        print("⚡ GPU not available → model on CPU")
+        print("⚡ Model on CPU")
 
-    # Load clusters metadata (centroids etc.)
-    cluster_centroids: Optional[np.ndarray] = None
-    cluster_labels: Optional[np.ndarray] = None
-
+    # CLUSTERS (optional)
+    cluster_centroids = None
+    cluster_labels = None
     if CLUSTERS_JSON.exists():
         try:
             with open(CLUSTERS_JSON, "r", encoding="utf8") as f:
                 data = json.load(f)
+
             clusters = data.get("clusters", {})
-            labels = []
             centroids = []
+            labels = []
             for label_str, meta in clusters.items():
                 labels.append(int(label_str))
                 centroids.append(np.array(meta["centroid"], dtype=np.float32))
-            if centroids:
-                cluster_centroids = np.stack(centroids, axis=0)
-                cluster_labels = np.array(labels, dtype=np.int32)
-            print(f"✅ Loaded {len(labels)} cluster centroids from clusters.json")
-        except Exception as e:
-            print(f"⚠️ Failed to load clusters.json: {e}")
 
+            if centroids:
+                cluster_centroids = np.stack(centroids)
+                cluster_labels = np.array(labels)
+
+            print(f"✅ Loaded {len(labels)} cluster centroids")
+        except Exception as e:
+            print("⚠ Failed loading clusters:", e)
+
+    # MONGO FIX 🔥🔥🔥
+    try:
+        mongo_client = MongoClient("mongodb://localhost:27017")
+        mongo_db = mongo_client["elevenSenseDB"]   # <-- EXACT DB NAME
+        mongo_col = mongo_db["posts"]              # <-- EXACT COLLECTION
+
+        app.state.mongo = mongo_col
+        print("🍃 Connected to MongoDB elevenSenseDB.posts")
+    except Exception as e:
+        print("❌ Mongo connect failed:", e)
+        app.state.mongo = None
+
+    # SAVE TO STATE
     app.state.client = client
     app.state.model = model
     app.state.cluster_centroids = cluster_centroids
     app.state.cluster_labels = cluster_labels
 
-    print("✅ ML service awake and alive ✅")
+    print("✅ ML service awake and alive")
 
 
 # ------------------ Helpers ------------------
 
 def embed_text(text: str) -> np.ndarray:
-    """Embed a single string into a normalized vector."""
-    model: SentenceTransformer = app.state.model
-    vec = model.encode(
-        [text],
-        normalize_embeddings=True,
-        convert_to_numpy=True,
-    ).astype(np.float32)[0]
-    return vec
+    model = app.state.model
+    vec = model.encode([text], normalize_embeddings=True, convert_to_numpy=True)[0]
+    return vec.astype(np.float32)
 
 
 def scoredpoint_to_result(p: ScoredPoint) -> SearchResult:
-    """
-    Convert a Qdrant point into API result.
-    PUBLIC id = url (fallback to Qdrant ID if missing).
-    """
     payload = p.payload or {}
     url = payload.get("url")
-    public_id = url if url is not None else str(p.id)
 
     return SearchResult(
-        id=public_id,
+        id=url if url else str(p.id),
         score=float(p.score),
         title=payload.get("title"),
         url=url,
@@ -208,18 +211,7 @@ def scoredpoint_to_result(p: ScoredPoint) -> SearchResult:
 
 
 def fetch_anchor_by_url(client: QdrantClient, url: str) -> ScoredPoint:
-    """
-    Given a URL, find the anchor point (with vectors & payload).
-    We use scroll + filter on payload.url == url.
-    """
-    flt = Filter(
-        must=[
-            FieldCondition(
-                key="url",
-                match=MatchValue(value=url),
-            )
-        ]
-    )
+    flt = Filter(must=[FieldCondition(key="url", match=MatchValue(value=url))])
 
     points, _ = client.scroll(
         collection_name=COLLECTION_NAME,
@@ -228,204 +220,125 @@ def fetch_anchor_by_url(client: QdrantClient, url: str) -> ScoredPoint:
         with_payload=True,
         with_vectors=True,
     )
-    if not points:
-        raise HTTPException(status_code=404, detail="Article with this URL not found")
 
-    # scroll returns 'Record', not ScoredPoint, but has same fields we need
+    if not points:
+        raise HTTPException(404, "URL not found")
+
     p = points[0]
-    # wrap into fake ScoredPoint-like object for type compatibility
-    sp = ScoredPoint(
+
+    return ScoredPoint(
         id=p.id,
         payload=p.payload,
         vector=p.vector,
         score=1.0,
-        version=0,
+        version=0
     )
-    return sp
 
 
-# ------------------ Routes ------------------
+# ===== SUMMARIZATION HELPERS =====
+
+def split_sentences(text: str):
+    parts = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [p.strip() for p in parts if len(p.strip()) > 20]
+
+
+def embed_sentences(sentences: list) -> np.ndarray:
+    vecs = app.state.model.encode(sentences, normalize_embeddings=True, convert_to_numpy=True)
+    return np.array(vecs, dtype=np.float32)
+
+
+# ------------------ ROUTES ------------------
 
 @app.get("/health", response_model=HealthResponse)
 def health_check():
-    """Simple heartbeat so your backend can check if service is alive."""
     return HealthResponse(status="ok")
 
 
-# -------- 1) Semantic search over all news --------
-
 @app.post("/search_text", response_model=List[SearchResult])
 def search_text(body: SearchRequest):
-    """
-    Semantic search on `news_articles` using the same BGE model
-    that was used during ingestion.
-
-    Body:
-    {
-      "query": "COP30 climate finance Brazil draft",
-      "limit": 5
-    }
-
-    Response items:
-    {
-      "id": "<url here>",      # <= URL as id
-      "score": 0.93,
-      "title": "...",
-      "url": "...",
-      "source": "...",
-      "domain": "...",
-      "published": "...",
-      "cluster": 8
-    }
-    """
-    client: QdrantClient = app.state.client
-
-    query_vec = embed_text(body.query).tolist()
+    client = app.state.client
+    vec = embed_text(body.query).tolist()
 
     res = client.query_points(
         collection_name=COLLECTION_NAME,
-        query=query_vec,
+        query=vec,
         limit=body.limit,
         with_payload=True,
-        with_vectors=False,
+        with_vectors=False
     )
-    hits: List[ScoredPoint] = res.points
 
-    return [scoredpoint_to_result(p) for p in hits]
+    return [scoredpoint_to_result(p) for p in res.points]
 
-
-# -------- 2) “Same story” group by URL (full coverage) --------
 
 @app.post("/same_story_by_id", response_model=SameStoryResponse)
 def same_story_by_id(body: SameStoryByIdRequest):
-    """
-    FULL COVERAGE-style endpoint.
 
-    Here `id` == URL of the anchor article.
-
-    Body:
-    {
-      "id": "https://telanganatoday.com/top-maoist-commander-madivi-hidma-killed-in-ap-encounter",
-      "limit": 25,
-      "min_score": 0.82
-    }
-    """
-    client: QdrantClient = app.state.client
-
-    # 1) find the anchor article by URL
-    anchor_sp = fetch_anchor_by_url(client, body.id)
-    anchor_vec = np.array(anchor_sp.vector, dtype=np.float32)
-    anchor_payload = anchor_sp.payload or {}
+    client = app.state.client
+    anchor = fetch_anchor_by_url(client, body.id)
+    anchor_vec = np.array(anchor.vector, dtype=np.float32)
 
     t0 = time.time()
-
-    # 2) vector search around this anchor
     res = client.query_points(
         collection_name=COLLECTION_NAME,
         query=anchor_vec.tolist(),
         limit=body.limit,
         with_payload=True,
-        with_vectors=False,
+        with_vectors=False
     )
-    hits: List[ScoredPoint] = res.points
 
-    # 3) filter by min_score and sort
-    filtered = [p for p in hits if p.score is not None and p.score >= body.min_score]
-    filtered.sort(key=lambda p: p.score, reverse=True)
+    hits = [p for p in res.points if p.score >= body.min_score]
+    hits.sort(key=lambda p: p.score, reverse=True)
 
-    items = [scoredpoint_to_result(p) for p in filtered]
-
-    anchor_result = SearchResult(
-        id=anchor_payload.get("url", body.id),
-        score=1.0,
-        title=anchor_payload.get("title"),
-        url=anchor_payload.get("url"),
-        source=anchor_payload.get("source"),
-        domain=anchor_payload.get("domain"),
-        published=anchor_payload.get("published"),
-        cluster=anchor_payload.get("cluster"),
-    )
+    items = [scoredpoint_to_result(p) for p in hits]
 
     took = time.time() - t0
+
     return SameStoryResponse(
-        anchor=anchor_result,
+        anchor=scoredpoint_to_result(anchor),
         items=items,
         took_seconds=round(took, 3),
-        took_minutes=round(took / 60.0, 3),
+        took_minutes=round(took / 60, 3),
     )
 
-
-# -------- 3) “Same story” group by free text (no URL yet) --------
 
 @app.post("/same_story_by_text", response_model=SameStoryResponse)
 def same_story_by_text(body: SameStoryByTextRequest):
-    """
-    For raw text (title or summary), find a same-story group.
 
-    Body:
-    {
-      "text": "Smriti Mandhana’s wedding delayed after father falls ill",
-      "limit": 25,
-      "min_score": 0.82
-    }
-    """
-    client: QdrantClient = app.state.client
+    client = app.state.client
+    vec = embed_text(body.text)
 
-    query_vec = embed_text(body.text)
     t0 = time.time()
 
     res = client.query_points(
         collection_name=COLLECTION_NAME,
-        query=query_vec.tolist(),
+        query=vec.tolist(),
         limit=body.limit,
         with_payload=True,
-        with_vectors=False,
+        with_vectors=False
     )
-    hits: List[ScoredPoint] = res.points
 
-    filtered = [p for p in hits if p.score is not None and p.score >= body.min_score]
-    filtered.sort(key=lambda p: p.score, reverse=True)
+    hits = [p for p in res.points if p.score >= body.min_score]
+    hits.sort(key=lambda p: p.score, reverse=True)
 
-    items = [scoredpoint_to_result(p) for p in filtered]
-
-    anchor = SearchResult(
-        id="query-text",
-        score=1.0,
-        title=body.text,
-        url=None,
-        source=None,
-        domain=None,
-        published=None,
-        cluster=None,
-    )
+    items = [scoredpoint_to_result(p) for p in hits]
 
     took = time.time() - t0
+
     return SameStoryResponse(
-        anchor=anchor,
+        anchor=SearchResult(id="query-text", score=1.0, title=body.text),
         items=items,
         took_seconds=round(took, 3),
-        took_minutes=round(took / 60.0, 3),
+        took_minutes=round(took / 60, 3),
     )
 
-
-# -------- 4) Cluster assignment using centroids.json --------
 
 @app.post("/route_cluster", response_model=ClusterAssignResponse)
 def route_cluster(body: ClusterAssignRequest):
-    """
-    Given article text (title or full text), assign it to an existing
-    topic cluster based on centroids from clusters.json.
 
-    Body:
-    {
-      "text": "US Fed hikes interest rates again",
-      "min_score": 0.72
-    }
-    """
-    centroids: Optional[np.ndarray] = app.state.cluster_centroids
-    labels: Optional[np.ndarray] = app.state.cluster_labels
+    centroids = app.state.cluster_centroids
+    labels = app.state.cluster_labels
 
-    if centroids is None or labels is None or len(centroids) == 0:
+    if centroids is None:
         return ClusterAssignResponse(
             has_clusters=False,
             assigned_cluster=-1,
@@ -435,55 +348,145 @@ def route_cluster(body: ClusterAssignRequest):
 
     vec = embed_text(body.text)
     sims = centroids @ vec
+
     best_idx = int(np.argmax(sims))
     best_score = float(sims[best_idx])
     best_label = int(labels[best_idx])
 
-    if best_score < body.min_score:
-        assigned = -1
-    else:
-        assigned = best_label
+    assigned = best_label if best_score >= body.min_score else -1
 
     return ClusterAssignResponse(
         has_clusters=True,
         assigned_cluster=assigned,
         best_score=best_score,
-        num_clusters_considered=int(len(labels)),
+        num_clusters_considered=len(labels),
     )
 
 
-# -------- 5) Small “ad-hoc” clustering of given IDs --------
+@app.post("/event-id")
+def get_event_id(body: EventIdRequest):
 
-@app.post("/cluster_ids", response_model=List[ClusterResultItem])
-def cluster_ids(body: ClusterRequest):
-    """
-    Cluster a set of specific article IDs with HDBSCAN.
-    NOTE: here ids are still Qdrant UUIDs, used only for debugging.
-    """
-    client: QdrantClient = app.state.client
+    client = app.state.client
 
-    if not body.ids:
-        return []
+    flt = Filter(must=[FieldCondition(key="url", match=MatchValue(value=body.url))])
 
-    points = client.retrieve(
+    points, _ = client.scroll(
         collection_name=COLLECTION_NAME,
-        ids=body.ids,
-        with_payload=False,
-        with_vectors=True,
+        scroll_filter=flt,
+        limit=1,
+        with_payload=True,
+        with_vectors=False
     )
 
     if not points:
-        return []
+        return {"event_id": None}
 
-    vectors = np.array([p.vector for p in points], dtype=np.float32)
+    payload = points[0].payload or {}
+    return {"event_id": payload.get("event_id")}
 
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=body.min_cluster_size,
-        metric="euclidean",
+
+# ========== SUMMARIZE CLUSTER (FIXED + MONGO WORKING) ===========
+
+@app.post("/summarize_cluster", response_model=SummarizeClusterResponse)
+def summarize_cluster(body: SummarizeClusterRequest):
+
+    client = app.state.client
+    mongo = app.state.mongo
+    if mongo is None:
+        raise HTTPException(500, "MongoDB not available")
+
+    t0 = time.time()
+
+    # 1. Fetch anchor
+    anchor = fetch_anchor_by_url(client, body.id)
+
+    # 2. Query similar articles
+    res = client.query_points(
+        collection_name=COLLECTION_NAME,
+        query=np.array(anchor.vector, dtype=np.float32).tolist(),
+        limit=body.per_article_limit + 40,
+        with_payload=True,
+        with_vectors=False
     )
-    labels = clusterer.fit_predict(vectors)
 
-    out: List[ClusterResultItem] = []
-    for p, lbl in zip(points, labels):
-        out.append(ClusterResultItem(id=str(p.id), label=int(lbl)))
-    return out
+    neighbors = [p for p in res.points if p.score >= DEFAULT_SAME_STORY_THRESHOLD]
+    neighbors.sort(key=lambda p: p.score, reverse=True)
+
+    items = [scoredpoint_to_result(p) for p in neighbors]
+
+    # 3. Fetch REAL TEXT from MongoDB
+    url_to_text = {}
+    for p in neighbors:
+        pl = p.payload or {}
+        url = pl.get("url")
+        if not url:
+            continue
+
+        doc = mongo.find_one({"url": url})
+        txt = doc.get("text") if doc else ""
+
+        url_to_text[url] = txt
+
+    # 4. Build sentence candidates
+    cand = []
+    for url, txt in url_to_text.items():
+        if not txt:
+            continue
+
+        sents = split_sentences(txt)[: body.per_article_limit * 4]
+        for s in sents[: body.per_article_limit]:
+            cand.append((url, s))
+
+    if not cand:
+        return SummarizeClusterResponse(
+            anchor=scoredpoint_to_result(anchor),
+            items=items,
+            summary="No text available",
+            highlights={},
+            took_seconds=round(time.time() - t0, 3)
+        )
+
+    sentences = [s for (_, s) in cand]
+    urls = [u for (u, _) in cand]
+
+    # 5. Embed sentences
+    vecs = embed_sentences(sentences)
+    centroid = vecs.mean(axis=0, keepdims=True)
+    sims = (vecs @ centroid.T).squeeze()
+
+    idxs = np.argsort(-sims)
+
+    # pick top
+    chosen = []
+    per_source = {}
+    for i in idxs:
+        if len(chosen) >= body.max_sentences:
+            break
+        url = urls[i]
+        if per_source.get(url, 0) >= 2:  # max 2 per article
+            continue
+        chosen.append(i)
+        per_source[url] = per_source.get(url, 0) + 1
+
+    chosen_sorted = sorted(chosen)
+    summary = " ".join(sentences[i] for i in chosen_sorted)
+
+    # highlights
+    highlights = {}
+    for url in set(urls):
+        idxs_url = [i for i, u in enumerate(urls) if u == url]
+        idxs_url = sorted(idxs_url, key=lambda i: -sims[i])[:2]
+        highlights[url] = [sentences[i] for i in idxs_url]
+
+    return SummarizeClusterResponse(
+        anchor=scoredpoint_to_result(anchor),
+        items=items,
+        summary=summary,
+        highlights=highlights,
+        took_seconds=round(time.time() - t0, 3)
+    )
+
+
+print("REGISTERED ROUTES:")
+for r in app.routes:
+    print(r.path)

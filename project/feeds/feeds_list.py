@@ -2,14 +2,14 @@ FEEDS = {
 
     # -----------------------------------------------------------
     # 🇮🇳 INDIAN NEWS (your originals + merged)
-    # -----------------------------------------------------------
-    "the_hindu_national": "https://www.thehindu.com/news/national/feeder/default.rss",
-    "the_hindu_world": "https://www.thehindu.com/news/international/feeder/default.rss",
-
-    "indianexpress": "https://indianexpress.com/feed/",
+    # -----------------------------------------------------------    "indianexpress": "https://indianexpress.com/feed/",
     "indianexpress_main": "https://indianexpress.com/feed/",
     "indianexpress_india": "https://indianexpress.com/section/india/feed/",
     "indianexpress_world": "https://indianexpress.com/section/world/feed/",
+
+    "the_hindu_national": "https://www.thehindu.com/news/national/feeder/default.rss",
+    "the_hindu_world": "https://www.thehindu.com/news/international/feeder/default.rss",
+
 
     "ndtv_latest": "https://feeds.feedburner.com/NDTV-LatestNews",
     "ndtv_top": "https://feeds.feedburner.com/ndtvnews-top-stories",

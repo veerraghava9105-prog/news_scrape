@@ -1,283 +1,244 @@
 # project/scripts/cluster_rebuild.py
 """
-Ultra-clean topic clustering system for your news vector universe.
-
-Process:
-1) Fetch all vectors from Qdrant
-2) Run HDBSCAN for semantic clustering
-3) Compute centroid + medoid per cluster
-4) Auto-classify clusters using medoid → HF zero-shot model
-5) Attach noise points by cosine ≥ 0.67
-6) Save summary + write to Qdrant
-
-This file is built for:
-- High accuracy
-- Zero noise misclassification
-- Expandable ML pipeline (summaries, bias modeling, narrative graphs)
+Mutual-kNN clustering for news deduplication.
+- No giant clusters ever again
+- Same-story = grouped
+- Unrelated stories = separate
+- MAX_CLUSTER_SIZE = 7 (trim by similarity)
+- canonical chosen by earliest timestamp
 """
 
 import json
-import time
-from dataclasses import dataclass, asdict
+import os
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
-import hdbscan
+from tqdm import tqdm
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import VectorParams, Distance
 
-from transformers import pipeline
+# ---------------- CONFIG ----------------
+QDRANT_HOST = os.environ.get("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.environ.get("QDRANT_PORT", 6333))
+COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "news_articles")
 
+K_NEIGHBORS = 10
+MIN_SIM = 0.70                      # GOOD DEFAULT (adjustable)
+MAX_CLUSTER_SIZE = 7                # HARD LIMIT — keeps feed clean
 
-# ================================================
-# CONFIG
-# ================================================
-QDRANT_HOST = "localhost"
-QDRANT_PORT = 6333
-COLLECTION_NAME = "news_articles"
+BATCH_SIZE_SCROLL = 1000
 
-VECTOR_SIZE = 768
-PAGE_SIZE = 10_000
-
-MIN_CLUSTER_SIZE = 10
-MIN_SAMPLES = 1
-HDBSCAN_METRIC = "euclidean"
-
-NOISE_ATTACH_THRESHOLD = 0.67  # YOUR MAGIC NUMBER
-
-BASE = Path(__file__).resolve().parents[1]
-DATA_DIR = BASE / "data"
+BASE_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = BASE_DIR / "data"
 CLUSTERS_JSON = DATA_DIR / "clusters.json"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+# ----------------------------------------
 
 
-# ================================================
-# CATEGORY MODEL (zero-shot)
-# ================================================
-CLASSIFIER = pipeline(
-    "zero-shot-classification",
-    model="facebook/bart-large-mnli"
-)
-
-CANDIDATE_LABELS = [
-    "politics",
-    "business",
-    "sports",
-    "technology",
-    "science",
-    "health",
-    "crime",
-    "entertainment",
-    "economy",
-    "world",
-    "environment",
-    "education",
-    "misc"
-]
+# ---------- HELPERS ----------
+def normalize_rows(mat: np.ndarray):
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return mat / norms
 
 
-# ================================================
-# DATA STRUCTURES
-# ================================================
-@dataclass
-class ClusterMeta:
-    label: int
-    size: int
-    centroid: List[float]
-    medoid_id: str
-    category: str
-    summary: str  # prepared for later
-
-
-@dataclass
-class ClusteringSummary:
-    num_points: int
-    num_clusters: int
-    num_noise: int
-    clusters: Dict[str, ClusterMeta]
-
-
-# ================================================
-# HELPERS
-# ================================================
-def ensure_collection(client: QdrantClient):
-    collections = {c.name for c in client.get_collections().collections}
-    if COLLECTION_NAME not in collections:
-        client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE)
-        )
-
-
-def fetch_all(client: QdrantClient):
-    ids = []
-    vectors = []
-    texts = []
-
+def fetch_all_points(client: QdrantClient):
+    pts = []
     offset = None
+
+    print("📡 Scrolling points from Qdrant (with vectors)...")
     while True:
-        points, offset = client.scroll(
-            COLLECTION_NAME,
-            limit=PAGE_SIZE,
-            offset=offset,
+        batch, offset = client.scroll(
+            collection_name=COLLECTION_NAME,
+            limit=BATCH_SIZE_SCROLL,
+            with_payload=True,
             with_vectors=True,
-            with_payload=True
+            offset=offset,
         )
-        if not points:
+        if not batch:
             break
-
-        for p in points:
-            ids.append(str(p.id))
-            vectors.append(p.vector)
-
-            payload = p.payload or {}
-            title = payload.get("title", "") or ""
-            source = payload.get("source", "") or ""
-            domain = payload.get("domain", "") or ""
-            url = payload.get("url", "") or ""
-
-            txt = " | ".join(x for x in (title, source, domain, url) if x)
-            texts.append(txt)
-
+        pts.extend(batch)
         if offset is None:
             break
 
-    return ids, np.array(vectors, dtype=np.float32), texts
+    print(f"➡️  Fetched {len(pts)} points")
+    return pts
 
 
-def run_hdbscan(vectors: np.ndarray):
-    model = hdbscan.HDBSCAN(
-        min_cluster_size=MIN_CLUSTER_SIZE,
-        min_samples=MIN_SAMPLES,
-        metric=HDBSCAN_METRIC,
-        core_dist_n_jobs=-1
-    )
-    return model.fit_predict(vectors)
+def parse_time(payload: dict) -> Optional[float]:
+    if not payload:
+        return None
+    if "scraped_at" in payload and isinstance(payload["scraped_at"], (int, float)):
+        return float(payload["scraped_at"])
+    pub = payload.get("published")
+    if isinstance(pub, (int, float)):
+        return float(pub)
+    return None
 
 
-def compute_centroid_and_medoid(vecs, ids):
-    centroid = vecs.mean(axis=0)
-    centroid /= (np.linalg.norm(centroid) + 1e-9)
+def choose_canonical(payloads, members):
+    best = members[0]
+    best_t = float("inf")
 
-    dists = np.linalg.norm(vecs - centroid, axis=1)
-    medoid = ids[int(dists.argmin())]
-    return centroid.tolist(), medoid
+    for idx in members:
+        t = parse_time(payloads[idx]) or float("inf")
+        if t < best_t:
+            best_t = t
+            best = idx
 
-
-def classify_cluster(text: str):
-    result = CLASSIFIER(text, CANDIDATE_LABELS)
-    return result["labels"][0]
-
-
-def attach_noise(ids, vectors, texts, labels, summary):
-    noise_idx = np.where(labels == -1)[0]
-    if len(noise_idx) == 0:
-        return labels, summary
-
-    # build centroid matrix
-    clabels = []
-    centroids = []
-    for k, meta in summary.clusters.items():
-        clabels.append(int(k))
-        centroids.append(np.array(meta.centroid, dtype=np.float32))
-    centroids = np.stack(centroids)
-
-    vec_norm = vectors / (np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-9)
-
-    for idx in noise_idx:
-        sims = centroids @ vec_norm[idx]
-        best = int(np.argmax(sims))
-        if sims[best] >= NOISE_ATTACH_THRESHOLD:
-            lbl = clabels[best]
-            labels[idx] = lbl
-            summary.clusters[str(lbl)].size += 1
-
-    summary.num_noise = int(np.sum(labels == -1))
-    return labels, summary
+    return best
 
 
-def save_summary(summary: ClusteringSummary):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CLUSTERS_JSON, "w") as f:
-        json.dump({
-            "num_points": summary.num_points,
-            "num_clusters": summary.num_clusters,
-            "num_noise": summary.num_noise,
-            "clusters": {k: asdict(v) for k, v in summary.clusters.items()}
-        }, f, indent=2)
+# ---------- MUTUAL-kNN CLUSTERING ----------
+class DSU:
+    def __init__(self, n: int):
+        self.p = list(range(n))
+        self.r = [0] * n
 
+    def find(self, a: int) -> int:
+        while self.p[a] != a:
+            self.p[a] = self.p[self.p[a]]
+            a = self.p[a]
+        return a
 
-def write_to_qdrant(client, ids, labels, summary):
-    for lbl in set(labels):
-        idxs = [ids[i] for i, l in enumerate(labels) if l == lbl]
-
-        if lbl == -1:
-            category = "noise"
+    def union(self, a: int, b: int):
+        a = self.find(a)
+        b = self.find(b)
+        if a == b:
+            return
+        if self.r[a] < self.r[b]:
+            self.p[a] = b
         else:
-            category = summary.clusters[str(lbl)].category
-
-        client.set_payload(
-            COLLECTION_NAME,
-            payload={"cluster": int(lbl), "category": category},
-            points=idxs
-        )
+            self.p[b] = a
+            if self.r[a] == self.r[b]:
+                self.r[a] += 1
 
 
-# ================================================
-# MAIN PIPELINE
-# ================================================
-def main():
-    t0 = time.time()
-    client = QdrantClient(QDRANT_HOST, port=QDRANT_PORT)
-    ensure_collection(client)
+def mutual_knn_clustering(vectors: np.ndarray, k: int, min_sim: float):
+    n = vectors.shape[0]
+    print(f"🔢 Building mutual-kNN (n={n}, k={k}, min_sim={min_sim}) ...")
 
-    ids, vecs, texts = fetch_all(client)
-    if not ids:
-        print("No points found.")
+    sims = vectors @ vectors.T  # FULL SIMILARITY MATRIX (n x n)
+    np.fill_diagonal(sims, -1.0)
+
+    topk_idx = np.argpartition(-sims, k, axis=1)[:, :k]
+
+    edges = []
+    for i in range(n):
+        for j in topk_idx[i]:
+            if sims[i, j] >= min_sim and i in topk_idx[j]:
+                edges.append((i, j))
+
+    print(f"→ mutual edges (undirected): {len(edges)}")
+
+    dsu = DSU(n)
+    for i, j in edges:
+        dsu.union(i, j)
+
+    comps = {}
+    for i in range(n):
+        r = dsu.find(i)
+        comps.setdefault(r, []).append(i)
+
+    print(f"🧩 Discovered {len(comps)} clusters (mutual-kNN).")
+    return list(comps.values())
+
+
+# ---------- MAIN ----------
+def run():
+    client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+
+    pts = fetch_all_points(client)
+    if not pts:
+        print("⚠️ No points found.")
         return
 
-    labels = run_hdbscan(vecs)
+    q_ids = [p.id for p in pts]
+    payloads = [p.payload or {} for p in pts]
 
-    # build cluster metadata
-    clusters = {}
-    unique = sorted({int(l) for l in labels if l != -1})
-    for lbl in unique:
-        idxs = np.where(labels == lbl)[0]
-        cids = [ids[i] for i in idxs]
-        cvecs = vecs[idxs]
-        ctexts = [texts[i] for i in idxs]
-
-        centroid, medoid_id = compute_centroid_and_medoid(cvecs, cids)
-        category = classify_cluster(ctexts[0]) if ctexts else "misc"
-
-        clusters[str(lbl)] = ClusterMeta(
-            label=lbl,
-            size=len(idxs),
-            centroid=centroid,
-            medoid_id=medoid_id,
-            category=category,
-            summary=""
-        )
-
-    summary = ClusteringSummary(
-        num_points=len(ids),
-        num_clusters=len(unique),
-        num_noise=int(np.sum(labels == -1)),
-        clusters=clusters
+    vecs = normalize_rows(
+        np.array([np.array(p.vector, dtype=np.float32) for p in pts])
     )
 
-    # noise rescue
-    labels, summary = attach_noise(ids, vecs, texts, labels, summary)
+    raw_clusters = mutual_knn_clustering(vecs, K_NEIGHBORS, MIN_SIM)
 
-    # write
-    write_to_qdrant(client, ids, labels, summary)
-    save_summary(summary)
+    clusters_out = {}
+    label_for_idx = {}
 
-    print("\nDONE.")
-    print("Clusters:", summary.num_clusters)
-    print("Noise:", summary.num_noise)
-    print("Time:", round(time.time() - t0, 2), "sec")
+    print("✂️ Applying MAX_CLUSTER_SIZE trimming (=", MAX_CLUSTER_SIZE, ")")
+
+    for label, members in enumerate(raw_clusters):
+
+        # ----- HARD TRIM (TOP-7 BY SIMILARITY TO CENTROID) -----
+        if len(members) > MAX_CLUSTER_SIZE:
+            mvecs = vecs[members]
+            centroid = mvecs.mean(axis=0)
+            centroid /= np.linalg.norm(centroid) + 1e-8
+
+            sims = mvecs @ centroid
+            top = np.argsort(-sims)[:MAX_CLUSTER_SIZE]
+            members = [members[i] for i in top]
+
+        # centroid (for saving)
+        mvecs = vecs[members]
+        centroid = mvecs.mean(axis=0)
+        centroid /= np.linalg.norm(centroid) + 1e-8
+
+        canon_local = choose_canonical(payloads, members)
+        canon_qid = q_ids[canon_local]
+        canon_url = payloads[canon_local].get("url", str(canon_qid))
+
+        clusters_out[str(label)] = {
+            "label": label,
+            "size": len(members),
+            "canonical_point_id": str(canon_qid),
+            "canonical_url": canon_url,
+            "members": [str(q_ids[m]) for m in members],
+        }
+
+        for m in members:
+            label_for_idx[m] = label
+
+    # ---- SAVE CLUSTERS.JSON ----
+    save_obj = {
+        "k_neighbors": K_NEIGHBORS,
+        "threshold": MIN_SIM,
+        "max_cluster_size": MAX_CLUSTER_SIZE,
+        "num_points": len(pts),
+        "clusters": clusters_out,
+    }
+
+    with open(CLUSTERS_JSON, "w", encoding="utf8") as f:
+        json.dump(save_obj, f, indent=2)
+
+    print(f"✅ Saved {CLUSTERS_JSON} ({len(clusters_out)} clusters)")
+
+    # ---- UPDATE PAYLOADS ----
+    print("✏️ Updating Qdrant payloads: event_id, canonical, event_size ...")
+
+    for idx, qid in enumerate(q_ids):
+        label = label_for_idx.get(idx, -1)
+        size = clusters_out.get(str(label), {}).get("size", 1)
+        is_canon = clusters_out.get(str(label), {}).get("canonical_point_id", "") == str(qid)
+
+        newp = payloads[idx].copy()
+        newp.update({
+            "event_id": label,
+            "event_size": size,
+            "canonical": bool(is_canon),
+        })
+
+        client.set_payload(
+            collection_name=COLLECTION_NAME,
+            points=[qid],
+            payload=newp,
+        )
+
+    print("🎯 Done!")
+    print("Example clusters:")
+    for k, v in list(clusters_out.items())[:5]:
+        print(f" - {k}: size={v['size']} canonical={v['canonical_url']}")
 
 
 if __name__ == "__main__":
-    main()
+    run()
